@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: MIT
 
 mod file_drop;
+mod resize;
 
 use crate::{
-  webview::{proxy::ProxyConfig, PageLoadEvent, WebContext, WebViewAttributes, RGBA},
+  webview::{
+    proxy::ProxyConfig, PageLoadEvent, RequestAsyncResponder, WebContext, WebViewAttributes, RGBA,
+  },
   Error, Result,
 };
 
@@ -13,6 +16,7 @@ use file_drop::FileDropController;
 use url::Url;
 
 use std::{
+  borrow::Cow,
   collections::HashSet,
   fmt::Write,
   iter::once,
@@ -28,9 +32,7 @@ use once_cell::unsync::OnceCell;
 use windows::{
   core::{ComInterface, PCSTR, PCWSTR, PWSTR},
   Win32::{
-    Foundation::{
-      BOOL, E_FAIL, E_POINTER, FARPROC, HGLOBAL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
-    },
+    Foundation::*,
     Globalization::{self, MAX_LOCALE_NAME},
     System::{
       Com::{IStream, StructuredStorage::CreateStreamOnHGlobal},
@@ -40,7 +42,7 @@ use windows::{
     },
     UI::{
       Shell::{DefSubclassProc, SetWindowSubclass},
-      WindowsAndMessaging as win32wm,
+      WindowsAndMessaging::{self as win32wm},
     },
   },
 };
@@ -48,7 +50,7 @@ use windows::{
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 
 use crate::application::{platform::windows::WindowExtWindows, window::Window};
-use http::Request;
+use http::{Request, Response as HttpResponse, StatusCode};
 
 use super::Theme;
 
@@ -394,11 +396,11 @@ window.addEventListener('mousemove', (e) => window.chrome.webview.postMessage('_
             let js = take_pwstr(js);
             if js == "__WEBVIEW_LEFT_MOUSE_DOWN__" || js == "__WEBVIEW_MOUSE_MOVE__" {
               if !window.is_decorated() && window.is_resizable() && !window.is_maximized() {
-                use crate::application::{platform::windows::hit_test, window::CursorIcon};
+                use crate::application::window::CursorIcon;
 
                 let mut point = POINT::default();
                 win32wm::GetCursorPos(&mut point);
-                let result = hit_test(window.hwnd(), point.x, point.y);
+                let result = resize::hit_test(window.hwnd(), point.x, point.y);
                 let cursor = match result.0 as u32 {
                   win32wm::HTLEFT => CursorIcon::WResize,
                   win32wm::HTTOP => CursorIcon::NResize,
@@ -419,7 +421,13 @@ window.addEventListener('mousemove', (e) => window.chrome.webview.postMessage('_
                   // we ignore `HTCLIENT` variant so the webview receives the click correctly if it is not on the edges
                   // and prevent conflict with `tao::window::drag_window`.
                   if result.0 as u32 != win32wm::HTCLIENT {
-                    window.begin_resize_drag(result.0, win32wm::WM_NCLBUTTONDOWN, point.x, point.y);
+                    resize::begin_resize_drag(
+                      window.hwnd(),
+                      result.0,
+                      win32wm::WM_NCLBUTTONDOWN,
+                      point.x,
+                      point.y,
+                    );
                   }
                 }
               }
@@ -659,55 +667,31 @@ window.addEventListener('mousemove', (e) => window.chrome.webview.postMessage('_
                     Err(_) => return Err(E_FAIL.into()),
                   };
 
-                  return match (custom_protocol.1)(&final_request) {
-                    Ok(sent_response) => {
-                      let content = sent_response.body();
-                      let status_code = sent_response.status();
-
-                      let mut headers_map = String::new();
-
-                      // build headers
-                      for (name, value) in sent_response.headers().iter() {
-                        let header_key = name.to_string();
-                        if let Ok(value) = value.to_str() {
-                          let _ = writeln!(headers_map, "{}: {}", header_key, value);
+                  let env = env.clone();
+                  let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> =
+                    Box::new(move |sent_response| {
+                      match prepare_web_request_response(&env, sent_response) {
+                        Ok(response) => {
+                          let _ = args.SetResponse(&response);
+                        }
+                        Err(_) => {
+                          let status = StatusCode::BAD_REQUEST;
+                          if let Ok(res) = env.CreateWebResourceResponse(
+                            None,
+                            status.as_u16() as i32,
+                            PCWSTR::from_raw(
+                              encode_wide(status.canonical_reason().unwrap_or("")).as_ptr(),
+                            ),
+                            PCWSTR::from_raw(encode_wide(String::new()).as_ptr()),
+                          ) {
+                            let _ = args.SetResponse(&res);
+                          }
                         }
                       }
+                    });
 
-                      let mut body_sent = None;
-                      if !content.is_empty() {
-                        let stream = CreateStreamOnHGlobal(HGLOBAL(0), true)?;
-                        stream.SetSize(content.len() as u64)?;
-                        let mut cb_write = MaybeUninit::uninit();
-                        if stream
-                          .Write(
-                            content.as_ptr() as *const _,
-                            content.len() as u32,
-                            Some(cb_write.as_mut_ptr()),
-                          )
-                          .is_ok()
-                          && cb_write.assume_init() as usize == content.len()
-                        {
-                          body_sent = Some(stream);
-                        }
-                      }
-
-                      // FIXME: Set http response version
-
-                      let response = env.CreateWebResourceResponse(
-                        body_sent.as_ref(),
-                        status_code.as_u16() as i32,
-                        PCWSTR::from_raw(
-                          encode_wide(status_code.canonical_reason().unwrap_or("OK")).as_ptr(),
-                        ),
-                        PCWSTR::from_raw(encode_wide(headers_map).as_ptr()),
-                      )?;
-
-                      args.SetResponse(&response)?;
-                      Ok(())
-                    }
-                    Err(_) => Err(E_FAIL.into()),
-                  };
+                  (custom_protocol.1)(final_request, RequestAsyncResponder { responder });
+                  return Ok(());
                 }
               }
 
@@ -962,6 +946,51 @@ window.addEventListener('mousemove', (e) => window.chrome.webview.postMessage('_
   }
 }
 
+unsafe fn prepare_web_request_response(
+  env: &ICoreWebView2Environment,
+  sent_response: HttpResponse<Cow<'static, [u8]>>,
+) -> windows::core::Result<ICoreWebView2WebResourceResponse> {
+  let content = sent_response.body();
+  let status_code = sent_response.status();
+
+  let mut headers_map = String::new();
+
+  // build headers
+  for (name, value) in sent_response.headers().iter() {
+    let header_key = name.to_string();
+    if let Ok(value) = value.to_str() {
+      let _ = writeln!(headers_map, "{}: {}", header_key, value);
+    }
+  }
+
+  let mut body_sent = None;
+  if !content.is_empty() {
+    let stream = CreateStreamOnHGlobal(HGLOBAL(0), true)?;
+    stream.SetSize(content.len() as u64)?;
+    let mut cb_write = MaybeUninit::uninit();
+    if stream
+      .Write(
+        content.as_ptr() as *const _,
+        content.len() as u32,
+        Some(cb_write.as_mut_ptr()),
+      )
+      .is_ok()
+      && cb_write.assume_init() as usize == content.len()
+    {
+      body_sent = Some(stream);
+    }
+  }
+
+  // FIXME: Set http response version
+
+  env.CreateWebResourceResponse(
+    body_sent.as_ref(),
+    status_code.as_u16() as i32,
+    PCWSTR::from_raw(encode_wide(status_code.canonical_reason().unwrap_or("OK")).as_ptr()),
+    PCWSTR::from_raw(encode_wide(headers_map).as_ptr()),
+  )
+}
+
 fn encode_wide(string: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
   string.as_ref().encode_wide().chain(once(0)).collect()
 }
@@ -1072,10 +1101,15 @@ fn get_function_impl(library: &str, function: &str) -> Option<FARPROC> {
 
 macro_rules! get_function {
   ($lib:expr, $func:ident) => {
-    get_function_impl(concat!($lib, '\0'), concat!(stringify!($func), '\0'))
-      .map(|f| unsafe { std::mem::transmute::<windows::Win32::Foundation::FARPROC, $func>(f) })
+    crate::webview::webview2::get_function_impl(
+      concat!($lib, '\0'),
+      concat!(stringify!($func), '\0'),
+    )
+    .map(|f| unsafe { std::mem::transmute::<windows::Win32::Foundation::FARPROC, $func>(f) })
   };
 }
+
+pub(crate) use get_function;
 
 /// Returns a tuple of (major, minor, buildnumber)
 fn get_windows_ver() -> Option<(u32, u32, u32)> {

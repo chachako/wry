@@ -3,18 +3,18 @@
 // SPDX-License-Identifier: MIT
 
 use super::{PageLoadEvent, WebContext, WebViewAttributes, RGBA};
-use crate::{application::window::Window, Result};
+use crate::{application::window::Window, webview::RequestAsyncResponder, Result};
 use base64::{engine::general_purpose, Engine};
 use crossbeam_channel::*;
 use html5ever::{interface::QualName, namespace_url, ns, tendril::TendrilSink, LocalName};
 use http::{
   header::{HeaderValue, CONTENT_SECURITY_POLICY, CONTENT_TYPE},
-  Request, Response,
+  Request, Response as HttpResponse,
 };
 use kuchiki::NodeRef;
 use once_cell::sync::OnceCell;
 use sha2::{Digest, Sha256};
-use std::{borrow::Cow, rc::Rc};
+use std::{borrow::Cow, rc::Rc, sync::mpsc::channel};
 use tao::platform::android::ndk_glue::{
   jni::{
     errors::Error as JniError,
@@ -36,139 +36,34 @@ pub struct Context<'a, 'b> {
   pub webview: &'a JObject<'b>,
 }
 
-#[macro_export]
-macro_rules! android_binding {
-  ($domain:ident, $package:ident, $main:ident) => {
-    android_binding!($domain, $package, $main, ::wry)
-  };
-  ($domain:ident, $package:ident, $main:ident, $wry:path) => {
-    use $wry::{
-      application::{
-        android_binding as tao_android_binding, android_fn, generate_package_name,
-        platform::android::ndk_glue::*,
-      },
-      webview::prelude::*,
-    };
-    tao_android_binding!($domain, $package, WryActivity, setup, $main);
-    android_fn!(
-      $domain,
-      $package,
-      RustWebViewClient,
-      handleRequest,
-      [JObject],
-      jobject
-    );
-    android_fn!(
-      $domain,
-      $package,
-      RustWebViewClient,
-      withAssetLoader,
-      [],
-      jboolean
-    );
-    android_fn!(
-      $domain,
-      $package,
-      RustWebViewClient,
-      assetLoaderDomain,
-      [],
-      jstring
-    );
-    android_fn!(
-      $domain,
-      $package,
-      RustWebViewClient,
-      shouldOverride,
-      [JString],
-      jboolean
-    );
-    android_fn!(
-      $domain,
-      $package,
-      RustWebView,
-      shouldOverride,
-      [JString],
-      jboolean
-    );
-    android_fn!(
-      $domain,
-      $package,
-      RustWebViewClient,
-      onPageLoading,
-      [JString]
-    );
-    android_fn!(
-      $domain,
-      $package,
-      RustWebViewClient,
-      onPageLoaded,
-      [JString]
-    );
-    android_fn!($domain, $package, Ipc, ipc, [JString]);
-    android_fn!(
-      $domain,
-      $package,
-      RustWebChromeClient,
-      handleReceivedTitle,
-      [JObject, JString],
-    );
+macro_rules! define_static_handlers {
+  ($($var:ident = $type_name:ident { $($fields:ident:$types:ty),+ $(,)? });+ $(;)?) => {
+    $(pub static $var: once_cell::sync::OnceCell<$type_name> = once_cell::sync::OnceCell::new();
+    pub struct $type_name {
+      $($fields: $types,)*
+    }
+    impl $type_name {
+      pub fn new($($fields: $types,)*) -> Self {
+        Self {
+          $($fields,)*
+        }
+      }
+    }
+    unsafe impl Send for $type_name {}
+    unsafe impl Sync for $type_name {})*
   };
 }
 
-pub static IPC: OnceCell<UnsafeIpc> = OnceCell::new();
-pub static REQUEST_HANDLER: OnceCell<UnsafeRequestHandler> = OnceCell::new();
-pub static TITLE_CHANGE_HANDLER: OnceCell<UnsafeTitleHandler> = OnceCell::new();
+define_static_handlers! {
+  IPC =  UnsafeIpc { handler: Box<dyn Fn(&Window, String)>,  window: Rc<Window> };
+  REQUEST_HANDLER = UnsafeRequestHandler { handler:  Box<dyn Fn(Request<Vec<u8>>) -> Option<HttpResponse<Cow<'static, [u8]>>>> };
+  TITLE_CHANGE_HANDLER = UnsafeTitleHandler { handler: Box<dyn Fn(&Window, String)>,  window: Rc<Window> };
+  URL_LOADING_OVERRIDE = UnsafeUrlLoadingOverride { handler: Box<dyn Fn(String) -> bool> };
+  ON_LOAD_HANDLER = UnsafeOnPageLoadHandler { handler: Box<dyn Fn(PageLoadEvent, String)> };
+}
+
 pub static WITH_ASSET_LOADER: OnceCell<bool> = OnceCell::new();
 pub static ASSET_LOADER_DOMAIN: OnceCell<String> = OnceCell::new();
-pub static URL_LOADING_OVERRIDE: OnceCell<UnsafeUrlLoadingOverride> = OnceCell::new();
-pub static ON_LOAD_HANDLER: OnceCell<UnsafeOnPageLoadHandler> = OnceCell::new();
-
-pub struct UnsafeIpc(Box<dyn Fn(&Window, String)>, Rc<Window>);
-impl UnsafeIpc {
-  pub fn new(f: Box<dyn Fn(&Window, String)>, w: Rc<Window>) -> Self {
-    Self(f, w)
-  }
-}
-unsafe impl Send for UnsafeIpc {}
-unsafe impl Sync for UnsafeIpc {}
-
-pub struct UnsafeRequestHandler(
-  Box<dyn Fn(Request<Vec<u8>>) -> Option<Response<Cow<'static, [u8]>>>>,
-);
-impl UnsafeRequestHandler {
-  pub fn new(f: Box<dyn Fn(Request<Vec<u8>>) -> Option<Response<Cow<'static, [u8]>>>>) -> Self {
-    Self(f)
-  }
-}
-unsafe impl Send for UnsafeRequestHandler {}
-unsafe impl Sync for UnsafeRequestHandler {}
-
-pub struct UnsafeTitleHandler(Box<dyn Fn(&Window, String)>, Rc<Window>);
-impl UnsafeTitleHandler {
-  pub fn new(f: Box<dyn Fn(&Window, String)>, w: Rc<Window>) -> Self {
-    Self(f, w)
-  }
-}
-unsafe impl Send for UnsafeTitleHandler {}
-unsafe impl Sync for UnsafeTitleHandler {}
-
-pub struct UnsafeUrlLoadingOverride(Box<dyn Fn(String) -> bool>);
-impl UnsafeUrlLoadingOverride {
-  pub fn new(f: Box<dyn Fn(String) -> bool>) -> Self {
-    Self(f)
-  }
-}
-unsafe impl Send for UnsafeUrlLoadingOverride {}
-unsafe impl Sync for UnsafeUrlLoadingOverride {}
-
-pub struct UnsafeOnPageLoadHandler(Box<dyn Fn(PageLoadEvent, String)>);
-impl UnsafeOnPageLoadHandler {
-  pub fn new(f: Box<dyn Fn(PageLoadEvent, String)>) -> Self {
-    Self(f)
-  }
-}
-unsafe impl Send for UnsafeOnPageLoadHandler {}
-unsafe impl Sync for UnsafeOnPageLoadHandler {}
 
 pub unsafe fn setup(mut env: JNIEnv, looper: &ForeignLooper, activity: GlobalRef) {
   // we must create the WebChromeClient here because it calls `registerForActivityResult`,
@@ -292,52 +187,58 @@ impl InnerWebView {
             .parse()
             .unwrap();
 
-          if let Ok(mut response) = (custom_protocol.1)(&request) {
-            let should_inject_scripts = response
-              .headers()
-              .get(CONTENT_TYPE)
-              // Content-Type must begin with the media type, but is case-insensitive.
-              // It may also be followed by any number of semicolon-delimited key value pairs.
-              // We don't care about these here.
-              // source: https://httpwg.org/specs/rfc9110.html#rfc.section.8.3.1
-              .and_then(|content_type| content_type.to_str().ok())
-              .map(|content_type_str| content_type_str.to_lowercase().starts_with("text/html"))
-              .unwrap_or_default();
+          let (tx, rx) = channel();
+          let initialization_scripts = initialization_scripts.clone();
+          let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> =
+            Box::new(move |mut response| {
+              let should_inject_scripts = response
+                .headers()
+                .get(CONTENT_TYPE)
+                // Content-Type must begin with the media type, but is case-insensitive.
+                // It may also be followed by any number of semicolon-delimited key value pairs.
+                // We don't care about these here.
+                // source: https://httpwg.org/specs/rfc9110.html#rfc.section.8.3.1
+                .and_then(|content_type| content_type.to_str().ok())
+                .map(|content_type_str| content_type_str.to_lowercase().starts_with("text/html"))
+                .unwrap_or_default();
 
-            if should_inject_scripts && !initialization_scripts.is_empty() {
-              let mut document =
-                kuchiki::parse_html().one(String::from_utf8_lossy(response.body()).into_owned());
-              let csp = response.headers_mut().get_mut(CONTENT_SECURITY_POLICY);
-              let mut hashes = Vec::new();
-              with_html_head(&mut document, |head| {
-                // iterate in reverse order since we are prepending each script to the head tag
-                for script in initialization_scripts.iter().rev() {
-                  let script_el =
-                    NodeRef::new_element(QualName::new(None, ns!(html), "script".into()), None);
-                  script_el.append(NodeRef::new_text(script));
-                  head.prepend(script_el);
-                  if csp.is_some() {
-                    hashes.push(hash_script(script));
+              if should_inject_scripts && !initialization_scripts.is_empty() {
+                let mut document =
+                  kuchiki::parse_html().one(String::from_utf8_lossy(response.body()).into_owned());
+                let csp = response.headers_mut().get_mut(CONTENT_SECURITY_POLICY);
+                let mut hashes = Vec::new();
+                with_html_head(&mut document, |head| {
+                  // iterate in reverse order since we are prepending each script to the head tag
+                  for script in initialization_scripts.iter().rev() {
+                    let script_el =
+                      NodeRef::new_element(QualName::new(None, ns!(html), "script".into()), None);
+                    script_el.append(NodeRef::new_text(script));
+                    head.prepend(script_el);
+                    if csp.is_some() {
+                      hashes.push(hash_script(script));
+                    }
                   }
-                }
-              });
+                });
 
-              if let Some(csp) = csp {
-                let csp_string = csp.to_str().unwrap().to_string();
-                let csp_string = if csp_string.contains("script-src") {
-                  csp_string.replace("script-src", &format!("script-src {}", hashes.join(" ")))
-                } else {
-                  format!("{} script-src {}", csp_string, hashes.join(" "))
-                };
-                *csp = HeaderValue::from_str(&csp_string).unwrap();
+                if let Some(csp) = csp {
+                  let csp_string = csp.to_str().unwrap().to_string();
+                  let csp_string = if csp_string.contains("script-src") {
+                    csp_string.replace("script-src", &format!("script-src {}", hashes.join(" ")))
+                  } else {
+                    format!("{} script-src {}", csp_string, hashes.join(" "))
+                  };
+                  *csp = HeaderValue::from_str(&csp_string).unwrap();
+                }
+
+                *response.body_mut() = document.to_string().into_bytes().into();
               }
 
-              *response.body_mut() = document.to_string().into_bytes().into();
-            }
-            return Some(response);
-          }
-        }
+              tx.send(response).unwrap();
+            });
 
+          (custom_protocol.1)(request, RequestAsyncResponder { responder });
+          return Some(rx.recv().unwrap());
+        }
         None
       }))
     });
