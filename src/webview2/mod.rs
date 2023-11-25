@@ -15,24 +15,24 @@ use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 use url::Url;
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
-  core::{s, ComInterface, PCSTR, PCWSTR, PWSTR},
+  core::{s, ComInterface, PCWSTR, PWSTR},
   Win32::{
     Foundation::*,
     Globalization::{self, MAX_LOCALE_NAME},
-    Graphics::Gdi::{RedrawWindow, HBRUSH, HRGN, RDW_INTERNALPAINT},
+    Graphics::Gdi::{MapWindowPoints, RedrawWindow, HBRUSH, HRGN, RDW_INTERNALPAINT},
     System::{
       Com::{CoInitializeEx, IStream, COINIT_APARTMENTTHREADED},
-      LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
-      SystemInformation::OSVERSIONINFOW,
+      LibraryLoader::GetModuleHandleW,
       WinRT::EventRegistrationToken,
     },
     UI::{
       Shell::{DefSubclassProc, SHCreateMemStream, SetWindowSubclass},
       WindowsAndMessaging::{
-        self as win32wm, CreateWindowExW, DefWindowProcW, DestroyWindow, PostMessageW,
-        RegisterClassExW, RegisterWindowMessageA, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW,
-        CW_USEDEFAULT, HCURSOR, HICON, HMENU, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER,
-        SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_VISIBLE,
+        self as win32wm, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetParent,
+        PostMessageW, RegisterClassExW, RegisterWindowMessageA, SetWindowPos, ShowWindow,
+        CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HCURSOR, HICON, HMENU, SWP_ASYNCWINDOWPOS,
+        SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WNDCLASSEXW, WS_CHILD,
+        WS_CLIPCHILDREN, WS_VISIBLE,
       },
     },
   },
@@ -1010,6 +1010,36 @@ impl InnerWebView {
     set_theme(&self.webview, theme);
   }
 
+  pub fn bounds(&self) -> Rect {
+    let mut bounds = Rect::default();
+
+    if self.is_child {
+      let mut rect = RECT::default();
+      if unsafe { GetClientRect(self.hwnd, &mut rect) }.is_err() {
+        panic!("Unexpected GetClientRect failure")
+      }
+
+      let position_point = &mut [POINT {
+        x: rect.left,
+        y: rect.top,
+      }];
+      unsafe { MapWindowPoints(self.hwnd, GetParent(self.hwnd), position_point) };
+
+      bounds.x = position_point[0].x;
+      bounds.y = position_point[0].y;
+      bounds.width = (rect.right - rect.left) as u32;
+      bounds.height = (rect.bottom - rect.top) as u32;
+    } else {
+      let mut rect = RECT::default();
+      if unsafe { self.controller.Bounds(&mut rect) }.is_ok() {
+        bounds.width = (rect.right - rect.left) as u32;
+        bounds.height = (rect.bottom - rect.top) as u32;
+      }
+    }
+
+    bounds
+  }
+
   pub fn set_bounds(&self, bounds: Rect) {
     if self.is_child {
       unsafe {
@@ -1181,64 +1211,9 @@ pub fn platform_webview_version() -> Result<String> {
 }
 
 fn is_windows_7() -> bool {
-  if let Some(v) = get_windows_ver() {
-    // windows 7 is 6.1
-    if v.0 == 6 && v.1 == 1 {
-      return true;
-    }
-  }
-  false
-}
-
-fn get_function_impl(library: &str, function: &str) -> Option<FARPROC> {
-  let library = encode_wide(library);
-  assert_eq!(function.chars().last(), Some('\0'));
-  let function = PCSTR::from_raw(function.as_ptr());
-
-  // Library names we will use are ASCII so we can use the A version to avoid string conversion.
-  let module = unsafe { LoadLibraryW(PCWSTR::from_raw(library.as_ptr())) }.unwrap_or_default();
-  if module.is_invalid() {
-    None
-  } else {
-    Some(unsafe { GetProcAddress(module, function) })
-  }
-}
-
-macro_rules! get_function {
-  ($lib:expr, $func:ident) => {
-    crate::webview2::get_function_impl(concat!($lib, '\0'), concat!(stringify!($func), '\0'))
-      .map(|f| unsafe { std::mem::transmute::<windows::Win32::Foundation::FARPROC, $func>(f) })
-  };
-}
-
-pub(crate) use get_function;
-
-/// Returns a tuple of (major, minor, buildnumber)
-fn get_windows_ver() -> Option<(u32, u32, u32)> {
-  type RtlGetVersion = unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32;
-  let handle = get_function!("ntdll.dll", RtlGetVersion);
-  if let Some(rtl_get_version) = handle {
-    unsafe {
-      let mut vi = OSVERSIONINFOW {
-        dwOSVersionInfoSize: 0,
-        dwMajorVersion: 0,
-        dwMinorVersion: 0,
-        dwBuildNumber: 0,
-        dwPlatformId: 0,
-        szCSDVersion: [0; 128],
-      };
-
-      let status = (rtl_get_version)(&mut vi as _);
-
-      if status >= 0 {
-        Some((vi.dwMajorVersion, vi.dwMinorVersion, vi.dwBuildNumber))
-      } else {
-        None
-      }
-    }
-  } else {
-    None
-  }
+  let v = windows_version::OsVersion::current();
+  // windows 7 is 6.1
+  v.major == 6 && v.minor == 1
 }
 
 fn url_from_webview(webview: &ICoreWebView2) -> String {

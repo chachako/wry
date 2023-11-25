@@ -141,9 +141,11 @@ impl InnerWebView {
           let function = &mut *(*function as *mut Box<dyn Fn(String)>);
           let body: id = msg_send![msg, body];
           let utf8: *const c_char = msg_send![body, UTF8String];
-          let js = CStr::from_ptr(utf8).to_str().expect("Invalid UTF8 string");
-
-          (function)(js.to_string());
+          if let Ok(js) = CStr::from_ptr(utf8).to_str() {
+            (function)(js.to_string());
+          } else {
+            log::warn!("WebView received invalid UTF8 string from IPC.");
+          }
         } else {
           log::warn!("WebView instance is dropped! This handler shouldn't be called.");
         }
@@ -395,17 +397,19 @@ impl InnerWebView {
       #[cfg(target_os = "macos")]
       {
         let (x, y) = attributes.bounds.map(|b| (b.x, b.y)).unwrap_or((0, 0));
-        let (w, h) = attributes
-          .bounds
-          .map(|b| (b.width, b.height))
-          .unwrap_or_else(|| {
-            if is_child {
-              let frame = NSView::frame(ns_view);
-              (frame.size.width as u32, frame.size.height as u32)
-            } else {
-              (0, 0)
-            }
-          });
+        let (w, h) = if is_child {
+          attributes.bounds.map(|b| (b.width, b.height))
+        } else {
+          None
+        }
+        .unwrap_or_else(|| {
+          if is_child {
+            let frame = NSView::frame(ns_view);
+            (frame.size.width as u32, frame.size.height as u32)
+          } else {
+            (0, 0)
+          }
+        });
 
         let frame = CGRect {
           origin: window_position(if is_child { ns_view } else { webview }, x, y, h as f64),
@@ -1086,6 +1090,21 @@ r#"Object.defineProperty(window, 'ipc', {
 
   pub fn set_background_color(&self, _background_color: RGBA) -> Result<()> {
     Ok(())
+  }
+
+  pub fn bounds(&self) -> Rect {
+    unsafe {
+      let parent: id = msg_send![self.webview, superview];
+      let parent_frame: CGRect = msg_send![parent, frame];
+      let webview_frame: CGRect = msg_send![self.webview, frame];
+
+      Rect {
+        x: webview_frame.origin.x as i32,
+        y: (parent_frame.size.height - webview_frame.origin.y - webview_frame.size.height) as i32,
+        width: webview_frame.size.width as u32,
+        height: webview_frame.size.height as u32,
+      }
+    }
   }
 
   pub fn set_bounds(&self, bounds: Rect) {
