@@ -12,18 +12,21 @@ use gtk::{
   glib::{self, translate::FromGlibPtrFull},
   prelude::*,
 };
+use http::Request;
 use javascriptcore::ValueExt;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(any(debug_assertions, feature = "devtools"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(any(debug_assertions, feature = "devtools"))]
+use webkit2gtk::WebInspectorExt;
 use webkit2gtk::{
   AutoplayPolicy, InputMethodContextExt, LoadEvent, NavigationPolicyDecision,
   NavigationPolicyDecisionExt, NetworkProxyMode, NetworkProxySettings, PolicyDecisionType,
   PrintOperationExt, SettingsExt, URIRequest, URIRequestExt, UserContentInjectedFrames,
   UserContentManagerExt, UserScript, UserScriptInjectionTime,
-  WebContextExt as Webkit2gtkWeContextExt, WebInspectorExt, WebView, WebViewExt,
-  WebsiteDataManagerExt, WebsiteDataManagerExtManual, WebsitePolicies,
+  WebContextExt as Webkit2gtkWeContextExt, WebView, WebViewExt, WebsiteDataManagerExt,
+  WebsiteDataManagerExtManual, WebsitePolicies,
 };
 use webkit2gtk_sys::{
   webkit_get_major_version, webkit_get_micro_version, webkit_get_minor_version,
@@ -255,7 +258,7 @@ impl InnerWebView {
     Self::attach_handlers(&webview, web_context, &mut attributes);
 
     // IPC handler
-    Self::attach_ipc_handler(web_context, &mut attributes);
+    Self::attach_ipc_handler(webview.clone(), web_context, &mut attributes);
 
     // File drop handler
     if let Some(file_drop_handler) = attributes.file_drop_handler.take() {
@@ -490,7 +493,11 @@ impl InnerWebView {
     is_in_fixed_parent
   }
 
-  fn attach_ipc_handler(web_context: &WebContext, attributes: &mut WebViewAttributes) {
+  fn attach_ipc_handler(
+    webview: WebView,
+    web_context: &WebContext,
+    attributes: &mut WebViewAttributes,
+  ) {
     // Message handler
     let ipc_handler = attributes.ipc_handler.take();
     let manager = web_context.manager();
@@ -502,7 +509,12 @@ impl InnerWebView {
 
       if let Some(js) = msg.js_value() {
         if let Some(ipc_handler) = &ipc_handler {
-          ipc_handler(js.to_string());
+          ipc_handler(
+            Request::builder()
+              .uri(webview.uri().unwrap().to_string())
+              .body(js.to_string())
+              .unwrap(),
+          );
         }
       }
     });
@@ -511,6 +523,7 @@ impl InnerWebView {
     manager.register_script_message_handler("ipc");
   }
 
+  #[cfg(any(debug_assertions, feature = "devtools"))]
   fn attach_inspector_handlers(webview: &WebView) -> Arc<AtomicBool> {
     let is_inspector_open = Arc::new(AtomicBool::default());
     if let Some(inspector) = webview.inspector() {
