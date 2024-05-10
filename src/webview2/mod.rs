@@ -744,7 +744,7 @@ impl InnerWebView {
         };
 
         #[cfg(feature = "tracing")]
-        let _span = tracing::info_span!("wry::ipc::handle").entered();
+        let _span = tracing::info_span!(parent: None, "wry::ipc::handle").entered();
         ipc_handler(Request::builder().uri(url).body(js).unwrap());
 
         Ok(())
@@ -785,7 +785,7 @@ impl InnerWebView {
         };
 
         #[cfg(feature = "tracing")]
-        let span = tracing::info_span!("wry::custom_protocol::handle", uri = tracing::field::Empty)
+        let span = tracing::info_span!(parent: None, "wry::custom_protocol::handle", uri = tracing::field::Empty)
           .entered();
 
         // Request uri
@@ -1268,10 +1268,7 @@ impl InnerWebView {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
 
-    self.set_bounds(Rect {
-      size: dpi::Size::Logical((width, height).into()),
-      ..Default::default()
-    })
+    self.set_bounds_inner((width, height).into(), (0, 0).into())
   }
 
   pub fn set_visible(&self, visible: bool) -> Result<()> {
